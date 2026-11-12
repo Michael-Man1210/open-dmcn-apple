@@ -304,8 +304,9 @@ final class AppModel {
     static func hostURL(_ input: String) -> URL? {
         var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.contains("://") { text = "https://" + text }
+        // Both lowercased: neither cares about case, and `HTTP://LOCALHOST` is still this machine.
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased(),
-            var host = url.host(percentEncoded: true), !host.isEmpty,
+            var host = url.host(percentEncoded: true)?.lowercased(), !host.isEmpty,
             scheme == "https" || (scheme == "http" && allowsPlainHTTP(to: host))
         else { return nil }
         // An IPv6 literal comes back from host() without its brackets, and the URL needs them.
@@ -316,7 +317,7 @@ final class AppModel {
     /// Plain HTTP never leaves this machine, and never ships: a release build always says no.
     private static func allowsPlainHTTP(to host: String) -> Bool {
         #if DEBUG
-            ["localhost", "127.0.0.1", "::1"].contains(host.lowercased())
+            ["localhost", "127.0.0.1", "::1"].contains(host)
         #else
             false
         #endif
