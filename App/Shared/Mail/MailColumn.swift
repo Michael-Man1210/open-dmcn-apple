@@ -1,5 +1,6 @@
 import DMCNKit
 import SwiftUI
+import UIKit
 
 /// The main column in the mail section: the list for the chosen view, or the open message.
 struct MailColumn: View {
@@ -42,6 +43,8 @@ struct MailList: View {
     /// What was picked there (nil folder: the Inbox), filed once the sheet is gone so the follow-up
     /// question can show.
     @State private var picked: (row: MailRow, folderID: String?)?
+    /// The row whose filing tray is open, if any.
+    @State private var openFilingRow: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -81,12 +84,13 @@ struct MailList: View {
                     }
                 } else {
                     ForEach(session.rows) { row in
-                        MailRowView(row: row, caution: session.filedByAddressOnly(row))
-                            .contentShape(Rectangle())
-                            .onTapGesture { session.open(row) }
-                            .plainRow()
-                            .swipeActions(edge: .trailing, allowsFullSwipe: false) { swipeButtons(row) }
-                            .swipeActions(edge: .leading, allowsFullSwipe: false) { fileButtons(row) }
+                        filingSwipe(row) {
+                            MailRowView(row: row, caution: session.filedByAddressOnly(row))
+                                .contentShape(Rectangle())
+                                .onTapGesture { session.open(row) }
+                        }
+                        .plainRow()
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) { swipeButtons(row) }
                     }
                 }
             }
@@ -94,6 +98,7 @@ struct MailList: View {
             .scrollContentBackground(.hidden)
             .background(.surfacePage)
             .refreshable { await session.refresh() }
+            .modifier(ClosesFilingTrayOnScroll(openID: $openFilingRow))
         }
         .sheet(
             item: $pickingFolderFor,
@@ -131,34 +136,55 @@ struct MailList: View {
         }
     }
 
-    /// A right swipe files the row: one button per folder slot, then ⋮ for every other folder.
-    /// The folder already being shown is left out, since filing there would do nothing.
-    @ViewBuilder private func fileButtons(_ row: MailRow) -> some View {
-        if session.canSwipeToFile, !row.isSent, !row.inDeleted {
-            let slots = session.swipeFolders.filter { MailFolder.folder($0.id) != session.folder }
-            ForEach(Array(slots.enumerated()), id: \.element.id) { index, folder in
-                Button {
-                    session.file(row, in: folder.id)
-                } label: {
-                    Label {
-                        Text(folder.name)
-                    } icon: {
-                        Icon.folder.image(20)
-                    }
-                }
-                .tint(LabelColor.color(LabelColor.choices[(index + 3) % LabelColor.choices.count]))
+    /// A right swipe files the row: one button per folder slot, then ⋮ for every other folder and
+    /// the Inbox. The folder already being shown is left out, since filing there would do nothing.
+    @ViewBuilder private func filingSwipe(_ row: MailRow, @ViewBuilder content: () -> some View) -> some View {
+        let folders = session.swipeFolders.filter { MailFolder.folder($0.id) != session.folder }
+        if !session.canSwipeToFile || row.isSent || row.inDeleted {
+            content()
+        } else if #available(iOS 18, *) {
+            FilingSwipeRow(
+                id: row.id,
+                folders: folders,
+                openID: $openFilingRow,
+                file: { session.file(row, in: $0) },
+                more: { pickingFolderFor = row }
+            ) {
+                content()
             }
+        } else {
+            // iOS 17 can't hand a drag back to the list, so it gets the system's swipe. Its buttons
+            // are wide, so only two folders fit beside ⋮.
+            content()
+                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                    fileButtons(row, folders: Array(folders.prefix(2)))
+                }
+        }
+    }
+
+    @ViewBuilder private func fileButtons(_ row: MailRow, folders: [FolderDef]) -> some View {
+        ForEach(Array(folders.enumerated()), id: \.element.id) { index, folder in
             Button {
-                pickingFolderFor = row
+                session.file(row, in: folder.id)
             } label: {
                 Label {
-                    Text("More folders")
+                    Text(folder.name)
                 } icon: {
-                    Icon.moreVertical.image(20)
+                    Icon.folder.image(20)
                 }
             }
-            .tint(.textMuted)
+            .tint(FilingSwipeColors.color(index))
         }
+        Button {
+            pickingFolderFor = row
+        } label: {
+            Label {
+                Text("More folders")
+            } icon: {
+                Icon.moreVertical.image(20)
+            }
+        }
+        .tint(.textMuted)
     }
 
     private func listNote(_ text: String) -> some View {
@@ -218,6 +244,210 @@ struct MailList: View {
                 }
                 .tint(.textMuted)
             }
+        }
+    }
+}
+
+/// A right swipe that files the row: up to four folder buttons and a half-width ⋮ for everything
+/// else, sized together to fit the row. Built by hand because the system's swipe buttons are a fixed
+/// width, so five don't fit a phone. Left swipes are still the system's own actions.
+@available(iOS 18, *)
+private struct FilingSwipeRow<Content: View>: View {
+    let id: String
+    let folders: [FolderDef]
+    /// The one row whose tray is open, shared by the list so opening one closes the rest.
+    @Binding var openID: String?
+    let file: (String) -> Void
+    let more: () -> Void
+    @ViewBuilder var content: Content
+
+    @State private var drag: CGFloat = 0
+    @State private var width: CGFloat = 0
+
+    private var isOpen: Bool { openID == id }
+    /// One folder button's width. ⋮ takes half of one. Together they leave a sliver of the row
+    /// showing, so it's clear what is being filed.
+    private var unit: CGFloat {
+        guard width > 0 else { return 76 }
+        return min(84, max(56, width * 0.86 / (CGFloat(folders.count) + 0.5)))
+    }
+    private var reveal: CGFloat { unit * (CGFloat(folders.count) + 0.5) }
+    private var offset: CGFloat {
+        let raw = (isOpen ? reveal : 0) + drag
+        // Past the end the row resists, the way the system's swipe does.
+        return raw > reveal ? reveal + (raw - reveal) * 0.25 : max(0, raw)
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            if offset > 0 { tray }
+            content
+                .overlay {
+                    // While open, a tap on the row closes the tray instead of opening the message.
+                    // Laid on before the offset so it slides with the row and leaves the tray's
+                    // buttons uncovered.
+                    if isOpen {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture { close() }
+                    }
+                }
+                .offset(x: offset)
+        }
+        .clipped()
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { newWidth in
+            width = newWidth
+        }
+        .gesture(FilingPan(takesLeftward: isOpen, moved: dragged, released: released))
+        .sensoryFeedback(.selection, trigger: offset >= reveal)
+        .accessibilityActions {
+            ForEach(folders, id: \.id) { folder in
+                Button("Move to \(folder.name)") { file(folder.id) }
+            }
+            Button("More folders") { more() }
+        }
+    }
+
+    private var tray: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(folders.enumerated()), id: \.element.id) { index, folder in
+                trayButton(color: FilingSwipeColors.color(index), width: unit) {
+                    file(folder.id)
+                } label: {
+                    VStack(spacing: 4) {
+                        Icon.folder.image(18)
+                        Text(folder.name).dsFont(.xxs, .semibold).lineLimit(1).minimumScaleFactor(0.7)
+                    }
+                    .padding(.horizontal, 4)
+                }
+            }
+            trayButton(color: .textMuted, width: unit / 2) {
+                more()
+            } label: {
+                Icon.moreVertical.image(18)
+            }
+            .accessibilityLabel("More folders")
+        }
+        .frame(width: reveal, alignment: .leading)
+        .frame(maxHeight: .infinity)
+    }
+
+    private func trayButton(
+        color: Color, width: CGFloat, action: @escaping () -> Void, @ViewBuilder label: () -> some View
+    ) -> some View {
+        Button {
+            close()
+            action()
+        } label: {
+            label()
+                .foregroundStyle(.white)
+                .frame(width: width)
+                .frame(maxHeight: .infinity)
+                .background(color)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func dragged(_ dx: CGFloat) {
+        // Starting to open this row puts away any other open tray.
+        if !isOpen, openID != nil { openID = nil }
+        drag = dx
+    }
+
+    /// `dx` is where the drag would coast to, so a quick flick opens or closes it too.
+    private func released(_ dx: CGFloat) {
+        let landing = (isOpen ? reveal : 0) + dx
+        withAnimation(.snappy) {
+            if landing > reveal / 2 {
+                openID = id
+            } else if isOpen {
+                openID = nil
+            }
+            drag = 0
+        }
+    }
+
+    private func close() {
+        withAnimation(.snappy) {
+            if isOpen { openID = nil }
+            drag = 0
+        }
+    }
+}
+
+/// The filing swipe's drag. A UIKit one, because UIKit can turn a touch down the moment it starts:
+/// only a sideways drag to the right (or to the left, to push an open tray shut) is taken, and the
+/// rest go on to the list, so scrolling and the system's left swipe keep working. SwiftUI's own drag
+/// can't hand a touch back, and the left swipe stopped working with it.
+@available(iOS 18, *)
+private struct FilingPan: UIGestureRecognizerRepresentable {
+    let takesLeftward: Bool
+    let moved: (CGFloat) -> Void
+    let released: (CGFloat) -> Void
+
+    func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+        let pan = UIPanGestureRecognizer()
+        pan.delegate = context.coordinator
+        return pan
+    }
+
+    func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
+        context.coordinator.takesLeftward = takesLeftward
+    }
+
+    func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
+        let dx = recognizer.translation(in: recognizer.view).x
+        switch recognizer.state {
+        case .began, .changed:
+            moved(dx)
+        case .ended:
+            // A short coast in the direction of travel, like SwiftUI's predicted end.
+            released(dx + recognizer.velocity(in: recognizer.view).x * 0.2)
+        case .cancelled, .failed:
+            released(dx)
+        default:
+            break
+        }
+    }
+
+    @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var takesLeftward = false
+
+        /// Asked once, as the touch starts to move: is this drag ours?
+        func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
+            // The distance moved still reads zero here, so go by the direction the finger is heading.
+            let heading = pan.velocity(in: pan.view)
+            return abs(heading.x) > abs(heading.y) * 1.5 && (heading.x > 0 || takesLeftward)
+        }
+    }
+}
+
+/// The folder colors, shared by the custom tray and the system swipe on iOS 17.
+private enum FilingSwipeColors {
+    static func color(_ index: Int) -> Color {
+        LabelColor.color(LabelColor.choices[(index + 3) % LabelColor.choices.count])
+    }
+}
+
+/// Scrolling the list puts away an open filing tray. The scroll phase arrived in iOS 18, the same
+/// as the custom tray; iOS 17 uses the system's swipe, which puts itself away.
+private struct ClosesFilingTrayOnScroll: ViewModifier {
+    @Binding var openID: String?
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18, *) {
+            content.onScrollPhaseChange { _, phase in
+                if phase != .idle, openID != nil { withAnimation(.snappy) { openID = nil } }
+            }
+        } else {
+            content
         }
     }
 }
