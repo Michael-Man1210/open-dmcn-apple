@@ -37,6 +37,11 @@ struct MailColumn: View {
 
 struct MailList: View {
     let session: MailSession
+    /// The row whose ⋮ swipe button opened the full folder list.
+    @State private var pickingFolderFor: MailRow?
+    /// What was picked there (nil folder: the Inbox), filed once the sheet is gone so the follow-up
+    /// question can show.
+    @State private var picked: (row: MailRow, folderID: String?)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -76,11 +81,12 @@ struct MailList: View {
                     }
                 } else {
                     ForEach(session.rows) { row in
-                        MailRowView(row: row)
+                        MailRowView(row: row, caution: session.filedByAddressOnly(row))
                             .contentShape(Rectangle())
                             .onTapGesture { session.open(row) }
                             .plainRow()
                             .swipeActions(edge: .trailing, allowsFullSwipe: false) { swipeButtons(row) }
+                            .swipeActions(edge: .leading, allowsFullSwipe: false) { fileButtons(row) }
                     }
                 }
             }
@@ -88,6 +94,70 @@ struct MailList: View {
             .scrollContentBackground(.hidden)
             .background(.surfacePage)
             .refreshable { await session.refresh() }
+        }
+        .sheet(
+            item: $pickingFolderFor,
+            onDismiss: {
+                if let choice = picked {
+                    picked = nil
+                    session.file(choice.row, in: choice.folderID)
+                }
+            }
+        ) { row in
+            FolderPicker(
+                includeInbox: session.folder != .inbox,
+                folders: session.folders.filter { MailFolder.folder($0.id) != session.folder }
+            ) { id in
+                picked = (row, id)
+                pickingFolderFor = nil
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .confirmationDialog(
+            session.filingOffer?.title ?? "",
+            isPresented: Binding(
+                get: { session.filingOffer != nil },
+                set: { if !$0 { session.declineFilingOffer() } }),
+            titleVisibility: .visible,
+            presenting: session.filingOffer
+        ) { offer in
+            Button(offer.answer) {
+                Task { await session.acceptFilingOffer(offer) }
+            }
+            // Not .cancel: a popover dialog hides its cancel button, and this answer should be seen.
+            Button("Just this one") { session.declineFilingOffer() }
+        } message: { offer in
+            Text(offer.summary)
+        }
+    }
+
+    /// A right swipe files the row: one button per folder slot, then ⋮ for every other folder.
+    /// The folder already being shown is left out, since filing there would do nothing.
+    @ViewBuilder private func fileButtons(_ row: MailRow) -> some View {
+        if session.canSwipeToFile, !row.isSent, !row.inDeleted {
+            let slots = session.swipeFolders.filter { MailFolder.folder($0.id) != session.folder }
+            ForEach(Array(slots.enumerated()), id: \.element.id) { index, folder in
+                Button {
+                    session.file(row, in: folder.id)
+                } label: {
+                    Label {
+                        Text(folder.name)
+                    } icon: {
+                        Icon.folder.image(20)
+                    }
+                }
+                .tint(LabelColor.color(LabelColor.choices[(index + 3) % LabelColor.choices.count]))
+            }
+            Button {
+                pickingFolderFor = row
+            } label: {
+                Label {
+                    Text("More folders")
+                } icon: {
+                    Icon.moreVertical.image(20)
+                }
+            }
+            .tint(.textMuted)
         }
     }
 
@@ -152,6 +222,44 @@ struct MailList: View {
     }
 }
 
+/// Every folder, for the swipe's ⋮ button, so a folder that isn't in a slot can still be reached,
+/// and the Inbox, to put something back. `pick` gets nil for the Inbox.
+private struct FolderPicker: View {
+    let includeInbox: Bool
+    let folders: [FolderDef]
+    let pick: (String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if includeInbox {
+                    choice(icon: .inbox, name: "Inbox") { pick(nil) }
+                }
+                ForEach(folders, id: \.id) { folder in
+                    choice(icon: .folder, name: folder.name) { pick(folder.id) }
+                }
+            }
+            .navigationTitle("Move to folder")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func choice(icon: Icon, name: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: Space.s3) {
+                icon.image(18).foregroundStyle(.textMuted)
+                Text(name).dsFont(.md).foregroundStyle(.textBody)
+            }
+        }
+    }
+}
+
 extension View {
     /// A list row with no system chrome: the row draws its own surface and rule.
     fileprivate func plainRow() -> some View {
@@ -162,6 +270,8 @@ extension View {
 /// One message in a list. Two lines and a snippet, as the web's phone layout.
 struct MailRowView: View {
     let row: MailRow
+    /// Filed by an address nothing checked: see `MailSession.filedByAddressOnly`.
+    var caution = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -182,7 +292,17 @@ struct MailRowView: View {
                         .lineLimit(1)
                         .truncationMode(.head)
                 }
-                if row.isNewSender { SmallTag(text: "NEW", weight: .semibold) }
+                if caution {
+                    Text("UNCHECKED")
+                        .dsFont(.xxs, .semibold)
+                        .foregroundStyle(.danger)
+                        .lineLimit(1)
+                        .padding(.horizontal, 5)
+                        .background(.dangerSubtle, in: .dsCard)
+                        .accessibilityLabel("Filed by address only. This sender wasn't checked.")
+                } else if row.isNewSender {
+                    SmallTag(text: "NEW", weight: .semibold)
+                }
                 if row.isStarred {
                     Icon.starFill.image(14).foregroundStyle(.warning).accessibilityLabel("Starred")
                 }
