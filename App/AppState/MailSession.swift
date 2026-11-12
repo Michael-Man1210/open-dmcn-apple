@@ -356,7 +356,8 @@ final class MailSession {
 
     // MARK: Swipe to file
 
-    /// After filing by swipe: whether the sender's mail should follow, now and from now on.
+    /// Filing by swipe asks first: this message alone, or the sender's mail now and from now on.
+    /// Nothing moves until the owner answers.
     struct FilingOffer: Identifiable, Equatable {
         let id = UUID()
         let sender: String
@@ -365,7 +366,9 @@ final class MailSession {
         /// lands anyway.
         let folderID: String?
         let folderName: String
-        /// The sender's other mail that moves too if the owner says yes.
+        /// The swiped message (every copy of it).
+        let hashes: [String]
+        /// The sender's other mail that moves too if the owner says always.
         let others: [String]
 
         var toInbox: Bool { folderID == nil }
@@ -413,30 +416,29 @@ final class MailSession {
         PlaceContext(address: address, flags: flags, filter: filter, knownFolderIDs: Set(folders.map(\.id)))
     }
 
-    /// Files the row in a folder, or back in the Inbox with nil, then offers to do the same with the
-    /// rest of the sender's mail. No offer when there's nothing it would change: a sender filing
-    /// can't follow, one a rule already files there, or (for the Inbox) no rule and nothing to move.
+    /// Files the row in a folder, or back in the Inbox with nil. Asks first whether the rest of the
+    /// sender's mail should follow, and moves nothing until answered. Files straight away when
+    /// there's nothing to ask: a sender filing can't follow, one a rule already files there, or (for
+    /// the Inbox) no rule and nothing else to move.
     func file(_ row: MailRow, in folderID: String?) {
         guard let message = messages.first(where: { $0.hash == row.id }) else { return }
         let others = MailView.sameSenderMail(as: message, into: folderID, among: messages, placeContext)
             .filter { !row.hashes.contains($0) }
-        for hash in row.hashes { setFlag(hash, FlagDelta(folderId: folderID.map { .set($0) } ?? .clear)) }
-        guard let sender = MailView.filingSender(message) else { return }
+        guard let sender = MailView.filingSender(message) else { return move(row.hashes, to: folderID) }
         let rule = swipeFiling.rule(for: sender)
-        if let folderID, rule?.folderID == folderID { return }
-        if folderID == nil, rule == nil, others.isEmpty { return }
+        if let folderID, rule?.folderID == folderID { return move(row.hashes, to: folderID) }
+        if folderID == nil, rule == nil, others.isEmpty { return move(row.hashes, to: folderID) }
         filingOffer = FilingOffer(
             sender: sender, senderName: name(for: sender), folderID: folderID,
-            folderName: folderID.map(folderName) ?? "the Inbox", others: others)
+            folderName: folderID.map(folderName) ?? "the Inbox", hashes: row.hashes, others: others)
     }
 
-    /// Yes: the sender's other mail moves now, and from here on their new mail is filed there by a
-    /// rule, or, for the Inbox, simply isn't filed any more. Takes the offer it answers, because the
-    /// dialog closing clears `filingOffer` before this runs.
+    /// Always: this message and the sender's other mail move now, and from here on their new mail is
+    /// filed there by a rule, or, for the Inbox, simply isn't filed any more. Takes the offer it
+    /// answers, because the dialog closing clears `filingOffer` before this runs.
     func acceptFilingOffer(_ offer: FilingOffer) async {
         if filingOffer == offer { filingOffer = nil }
-        let delta = FlagDelta(folderId: offer.folderID.map { .set($0) } ?? .clear)
-        for hash in offer.others { setFlag(hash, delta) }
+        move(offer.hashes + offer.others, to: offer.folderID)
         let (sender, now) = (offer.sender, Date())
         if let folderID = offer.folderID {
             _ = await change { $0.swipeFiling.setRule(sender: sender, folderID: folderID, now: now) }
@@ -445,8 +447,20 @@ final class MailSession {
         }
     }
 
-    func declineFilingOffer() {
+    /// Just this one: the swiped message moves, nothing else does, and no rule is made.
+    func fileOnlyThis(_ offer: FilingOffer) {
+        if filingOffer == offer { filingOffer = nil }
+        move(offer.hashes, to: offer.folderID)
+    }
+
+    /// Cancel, or the question went away: nothing moves.
+    func dismissFilingOffer() {
         filingOffer = nil
+    }
+
+    private func move(_ hashes: [String], to folderID: String?) {
+        let delta = FlagDelta(folderId: folderID.map { .set($0) } ?? .clear)
+        for hash in hashes { setFlag(hash, delta) }
     }
 
     /// Ordinary email in a folder from someone who isn't a contact: filed by its address alone,

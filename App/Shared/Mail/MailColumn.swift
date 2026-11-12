@@ -43,8 +43,8 @@ struct MailList: View {
     /// What was picked there (nil folder: the Inbox), filed once the sheet is gone so the follow-up
     /// question can show.
     @State private var picked: (row: MailRow, folderID: String?)?
-    /// The row whose filing tray is open, if any.
-    @State private var openFilingRow: String?
+    /// The row with a swipe tray open, if any.
+    @State private var openSwipe: OpenSwipe?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,13 +84,12 @@ struct MailList: View {
                     }
                 } else {
                     ForEach(session.rows) { row in
-                        filingSwipe(row) {
+                        swipeRow(row) {
                             MailRowView(row: row, caution: session.filedByAddressOnly(row))
                                 .contentShape(Rectangle())
                                 .onTapGesture { session.open(row) }
                         }
                         .plainRow()
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) { swipeButtons(row) }
                     }
                 }
             }
@@ -98,7 +97,7 @@ struct MailList: View {
             .scrollContentBackground(.hidden)
             .background(.surfacePage)
             .refreshable { await session.refresh() }
-            .modifier(ClosesFilingTrayOnScroll(openID: $openFilingRow))
+            .modifier(ClosesSwipeOnScroll(open: $openSwipe))
         }
         .sheet(
             item: $pickingFolderFor,
@@ -118,73 +117,94 @@ struct MailList: View {
             }
             .presentationDetents([.medium, .large])
         }
-        .confirmationDialog(
+        // An alert, not a confirmation dialog: on a phone that shows as a popover, which hides Cancel.
+        .alert(
             session.filingOffer?.title ?? "",
             isPresented: Binding(
                 get: { session.filingOffer != nil },
-                set: { if !$0 { session.declineFilingOffer() } }),
-            titleVisibility: .visible,
+                set: { if !$0 { session.dismissFilingOffer() } }),
             presenting: session.filingOffer
         ) { offer in
             Button(offer.answer) {
                 Task { await session.acceptFilingOffer(offer) }
             }
-            // Not .cancel: a popover dialog hides its cancel button, and this answer should be seen.
-            Button("Just this one") { session.declineFilingOffer() }
+            Button("Just this one") { session.fileOnlyThis(offer) }
+            Button("Cancel", role: .cancel) {}
         } message: { offer in
             Text(offer.summary)
         }
     }
 
-    /// A right swipe files the row: one button per folder slot, then ⋮ for every other folder and
-    /// the Inbox. The folder already being shown is left out, since filing there would do nothing.
-    @ViewBuilder private func filingSwipe(_ row: MailRow, @ViewBuilder content: () -> some View) -> some View {
-        let folders = session.swipeFolders.filter { MailFolder.folder($0.id) != session.folder }
-        if !session.canSwipeToFile || row.isSent || row.inDeleted {
-            content()
-        } else if #available(iOS 18, *) {
-            FilingSwipeRow(
-                id: row.id,
-                folders: folders,
-                openID: $openFilingRow,
-                file: { session.file(row, in: $0) },
-                more: { pickingFolderFor = row }
-            ) {
+    /// Both swipes: right files the row, left archives or deletes it. Drawn by hand on iOS 18, so
+    /// four folders and ⋮ fit and both sides look alike. iOS 17 gets the system's swipes, whose
+    /// buttons are wide, so only two folders fit beside ⋮ there.
+    @ViewBuilder private func swipeRow(_ row: MailRow, @ViewBuilder content: () -> some View) -> some View {
+        if #available(iOS 18, *) {
+            SwipeRow(id: row.id, open: $openSwipe, leading: fileActions(row), trailing: tidyActions(row)) {
                 content()
             }
         } else {
-            // iOS 17 can't hand a drag back to the list, so it gets the system's swipe. Its buttons
-            // are wide, so only two folders fit beside ⋮.
             content()
                 .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                    fileButtons(row, folders: Array(folders.prefix(2)))
+                    systemButtons(fileActions(row, folderLimit: 2))
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    // The system puts its first button at the edge; the tray lists them left to right.
+                    systemButtons(tidyActions(row).reversed())
                 }
         }
     }
 
-    @ViewBuilder private func fileButtons(_ row: MailRow, folders: [FolderDef]) -> some View {
-        ForEach(Array(folders.enumerated()), id: \.element.id) { index, folder in
-            Button {
-                session.file(row, in: folder.id)
-            } label: {
+    /// One button per folder slot, then ⋮ for every other folder and the Inbox. The folder already
+    /// being shown is left out, since filing there would do nothing.
+    private func fileActions(_ row: MailRow, folderLimit: Int = .max) -> [SwipeAction] {
+        guard session.canSwipeToFile, !row.isSent, !row.inDeleted else { return [] }
+        let folders = session.swipeFolders.filter { MailFolder.folder($0.id) != session.folder }
+        let buttons = folders.prefix(folderLimit).enumerated().map { index, folder in
+            SwipeAction(
+                id: folder.id, label: folder.name, spoken: "Move to \(folder.name)", icon: .folder,
+                color: SwipeAction.folderColor(index)
+            ) { session.file(row, in: folder.id) }
+        }
+        let more = SwipeAction(
+            id: "more", label: "More", spoken: "More folders", icon: .moreVertical, color: .textMuted, narrow: true
+        ) { pickingFolderFor = row }
+        return buttons + [more]
+    }
+
+    /// Left to right. Deleted mail offers Restore and a permanent delete; everything else, Archive
+    /// (not for sent mail) and Delete.
+    private func tidyActions(_ row: MailRow) -> [SwipeAction] {
+        if row.inDeleted {
+            return [
+                SwipeAction(id: "restore", label: "Restore", icon: .undo, color: .textMuted) { session.restore(row) },
+                SwipeAction(id: "forever", label: "Delete forever", icon: .trash, color: .danger, destructive: true) {
+                    session.deleteForever(row)
+                },
+            ]
+        }
+        let delete = SwipeAction(id: "delete", label: "Delete", icon: .trash, color: .danger, destructive: true) {
+            session.trash(row)
+        }
+        guard !row.isSent else { return [delete] }
+        let archive = SwipeAction(
+            id: "archive", label: row.inArchive ? "Unarchive" : "Archive", icon: .archive, color: .textMuted
+        ) { session.toggleArchive(row) }
+        return [archive, delete]
+    }
+
+    /// The same actions as the system's own swipe buttons, for iOS 17.
+    private func systemButtons(_ actions: [SwipeAction]) -> some View {
+        ForEach(actions) { action in
+            Button(role: action.destructive ? .destructive : nil, action: action.run) {
                 Label {
-                    Text(folder.name)
+                    Text(action.label)
                 } icon: {
-                    Icon.folder.image(20)
+                    action.icon.image(20)
                 }
             }
-            .tint(FilingSwipeColors.color(index))
+            .tint(action.color)
         }
-        Button {
-            pickingFolderFor = row
-        } label: {
-            Label {
-                Text("More folders")
-            } icon: {
-                Icon.moreVertical.image(20)
-            }
-        }
-        .tint(.textMuted)
     }
 
     private func listNote(_ text: String) -> some View {
@@ -197,96 +217,87 @@ struct MailList: View {
             .background(.surfaceCard)
             .overlay(alignment: .bottom) { Rectangle().fill(.borderSubtle).frame(height: 1) }
     }
+}
 
-    /// Deleted mail offers Restore and a permanent delete; everything else, Archive and Delete.
-    @ViewBuilder private func swipeButtons(_ row: MailRow) -> some View {
-        if row.inDeleted {
-            Button(role: .destructive) {
-                session.deleteForever(row)
-            } label: {
-                Label {
-                    Text("Delete forever")
-                } icon: {
-                    Icon.trash.image(20)
-                }
-            }
-            .tint(.danger)
-            Button {
-                session.restore(row)
-            } label: {
-                Label {
-                    Text("Restore")
-                } icon: {
-                    Icon.undo.image(20)
-                }
-            }
-            .tint(.textMuted)
-        } else {
-            Button(role: .destructive) {
-                session.trash(row)
-            } label: {
-                Label {
-                    Text("Delete")
-                } icon: {
-                    Icon.trash.image(20)
-                }
-            }
-            .tint(.danger)
-            if !row.isSent {
-                Button {
-                    session.toggleArchive(row)
-                } label: {
-                    Label {
-                        Text(row.inArchive ? "Unarchive" : "Archive")
-                    } icon: {
-                        Icon.archive.image(20)
-                    }
-                }
-                .tint(.textMuted)
-            }
-        }
+/// One button in a swipe tray.
+struct SwipeAction: Identifiable {
+    let id: String
+    let label: String
+    /// What VoiceOver says, when the label alone is too short.
+    var spoken: String?
+    let icon: Icon
+    let color: Color
+    /// Keeps a small fixed width (⋮); the other buttons share whatever is left.
+    var narrow = false
+    var destructive = false
+    let run: () -> Void
+
+    static func folderColor(_ index: Int) -> Color {
+        LabelColor.color(LabelColor.choices[(index + 3) % LabelColor.choices.count])
     }
 }
 
-/// A right swipe that files the row: up to four folder buttons and a half-width ⋮ for everything
-/// else, sized together to fit the row. Built by hand because the system's swipe buttons are a fixed
-/// width, so five don't fit a phone. Left swipes are still the system's own actions.
-@available(iOS 18, *)
-private struct FilingSwipeRow<Content: View>: View {
+/// The row with a tray open, and which side. Shared by the list, so opening one closes the rest.
+struct OpenSwipe: Equatable {
     let id: String
-    let folders: [FolderDef]
-    /// The one row whose tray is open, shared by the list so opening one closes the rest.
-    @Binding var openID: String?
-    let file: (String) -> Void
-    let more: () -> Void
+    let leading: Bool
+}
+
+/// A row with a tray on each side: swipe right for the leading buttons, left for the trailing ones.
+/// Built by hand because the system's swipe buttons are a fixed width, so five don't fit a phone,
+/// and drawn like the system's (a coloured pill, its name below) so it still feels at home.
+///
+/// The leading (filing) tray takes the whole row but a peek of the message, so it's clear what is
+/// being filed: ⋮ keeps its small width at the far end and the folders share the rest. The trailing
+/// tray is as wide as its buttons.
+@available(iOS 18, *)
+private struct SwipeRow<Content: View>: View {
+    let id: String
+    @Binding var open: OpenSwipe?
+    let leading: [SwipeAction]
+    let trailing: [SwipeAction]
     @ViewBuilder var content: Content
 
     @State private var drag: CGFloat = 0
     @State private var width: CGFloat = 0
 
-    private var isOpen: Bool { openID == id }
-    /// One folder button's width. ⋮ takes half of one. Together they leave a sliver of the row
-    /// showing, so it's clear what is being filed.
-    private var unit: CGFloat {
-        guard width > 0 else { return 76 }
-        return min(84, max(56, width * 0.86 / (CGFloat(folders.count) + 0.5)))
+    private var openLeading: Bool { open == OpenSwipe(id: id, leading: true) }
+    private var openTrailing: Bool { open == OpenSwipe(id: id, leading: false) }
+
+    private var leadingReveal: CGFloat {
+        guard !leading.isEmpty else { return 0 }
+        return max(width - SwipeMetrics.peek, SwipeMetrics.buttonWidth * CGFloat(leading.count))
     }
-    private var reveal: CGFloat { unit * (CGFloat(folders.count) + 0.5) }
+    private var trailingReveal: CGFloat { SwipeMetrics.buttonWidth * CGFloat(trailing.count) }
+    /// Where the row rests: right for the leading tray, left for the trailing one.
+    private var rest: CGFloat { openLeading ? leadingReveal : openTrailing ? -trailingReveal : 0 }
+
+    /// Positive shows the leading tray. Past the end the row resists, the way the system's swipe does.
     private var offset: CGFloat {
-        let raw = (isOpen ? reveal : 0) + drag
-        // Past the end the row resists, the way the system's swipe does.
-        return raw > reveal ? reveal + (raw - reveal) * 0.25 : max(0, raw)
+        let raw = rest + drag
+        if raw >= 0 {
+            guard !leading.isEmpty else { return 0 }
+            return raw > leadingReveal ? leadingReveal + (raw - leadingReveal) * 0.25 : raw
+        }
+        guard !trailing.isEmpty else { return 0 }
+        return raw < -trailingReveal ? -trailingReveal + (raw + trailingReveal) * 0.25 : raw
     }
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            if offset > 0 { tray }
+        ZStack {
+            if offset > 0 {
+                tray(leading, shown: offset, laidOutFor: leadingReveal)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if offset < 0 {
+                tray(trailing, shown: -offset, laidOutFor: trailingReveal)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
             content
                 .overlay {
                     // While open, a tap on the row closes the tray instead of opening the message.
-                    // Laid on before the offset so it slides with the row and leaves the tray's
-                    // buttons uncovered.
-                    if isOpen {
+                    // Laid on before the offset so it slides with the row and leaves the buttons
+                    // uncovered.
+                    if open?.id == id {
                         Color.clear
                             .contentShape(Rectangle())
                             .onTapGesture { close() }
@@ -300,90 +311,118 @@ private struct FilingSwipeRow<Content: View>: View {
         } action: { newWidth in
             width = newWidth
         }
-        .gesture(FilingPan(takesLeftward: isOpen, moved: dragged, released: released))
-        .sensoryFeedback(.selection, trigger: offset >= reveal)
+        .gesture(
+            SwipePan(
+                takesRight: open?.id == id || !leading.isEmpty,
+                takesLeft: open?.id == id || !trailing.isEmpty,
+                moved: dragged, released: released)
+        )
+        .sensoryFeedback(.selection, trigger: openLeading || openTrailing)
         .accessibilityActions {
-            ForEach(folders, id: \.id) { folder in
-                Button("Move to \(folder.name)") { file(folder.id) }
+            ForEach(leading + trailing) { action in
+                Button(action.spoken ?? action.label, action: action.run)
             }
-            Button("More folders") { more() }
         }
     }
 
-    private var tray: some View {
-        HStack(spacing: 0) {
-            ForEach(Array(folders.enumerated()), id: \.element.id) { index, folder in
-                trayButton(color: FilingSwipeColors.color(index), width: unit) {
-                    file(folder.id)
-                } label: {
-                    VStack(spacing: 4) {
-                        Icon.folder.image(18)
-                        Text(folder.name).dsFont(.xxs, .semibold).lineLimit(1).minimumScaleFactor(0.7)
-                    }
-                    .padding(.horizontal, 4)
+    /// A tray `shown` wide. The buttons are laid out for the open tray and stretch or squeeze with
+    /// the drag, as the system's do.
+    private func tray(_ actions: [SwipeAction], shown: CGFloat, laidOutFor reveal: CGFloat) -> some View {
+        let scale = reveal > 0 ? shown / reveal : 0
+        let narrow = actions.filter(\.narrow).count
+        let shared = actions.count - narrow
+        let each = shared > 0 ? max(0, reveal - CGFloat(narrow) * SwipeMetrics.narrowWidth) / CGFloat(shared) : 0
+        return HStack(spacing: 0) {
+            ForEach(actions) { action in
+                SwipeButton(action: action) {
+                    close()
+                    action.run()
                 }
+                .frame(width: (action.narrow ? SwipeMetrics.narrowWidth : each) * scale)
             }
-            trayButton(color: .textMuted, width: unit / 2) {
-                more()
-            } label: {
-                Icon.moreVertical.image(18)
-            }
-            .accessibilityLabel("More folders")
         }
-        .frame(width: reveal, alignment: .leading)
+        .frame(width: shown)
         .frame(maxHeight: .infinity)
-    }
-
-    private func trayButton(
-        color: Color, width: CGFloat, action: @escaping () -> Void, @ViewBuilder label: () -> some View
-    ) -> some View {
-        Button {
-            close()
-            action()
-        } label: {
-            label()
-                .foregroundStyle(.white)
-                .frame(width: width)
-                .frame(maxHeight: .infinity)
-                .background(color)
-        }
-        .buttonStyle(.plain)
+        .background(.surfaceSunken)
     }
 
     private func dragged(_ dx: CGFloat) {
-        // Starting to open this row puts away any other open tray.
-        if !isOpen, openID != nil { openID = nil }
+        // Starting on this row puts away a tray open on another.
+        if let open, open.id != id { withAnimation(.snappy) { self.open = nil } }
         drag = dx
     }
 
-    /// `dx` is where the drag would coast to, so a quick flick opens or closes it too.
+    /// `dx` is where the drag would coast to, so a quick flick opens or shuts a tray too.
     private func released(_ dx: CGFloat) {
-        let landing = (isOpen ? reveal : 0) + dx
+        let landing = rest + dx
+        let far = SwipeMetrics.threshold
+        // An open tray stays open unless pushed back far enough; a shut one opens once pulled far enough.
+        var next: OpenSwipe?
+        if landing > 0, !leading.isEmpty, openLeading ? dx > -far : landing > far {
+            next = OpenSwipe(id: id, leading: true)
+        } else if landing < 0, !trailing.isEmpty, openTrailing ? dx < far : landing < -far {
+            next = OpenSwipe(id: id, leading: false)
+        }
         withAnimation(.snappy) {
-            if landing > reveal / 2 {
-                openID = id
-            } else if isOpen {
-                openID = nil
-            }
+            if next != nil || open?.id == id { open = next }
             drag = 0
         }
     }
 
     private func close() {
         withAnimation(.snappy) {
-            if isOpen { openID = nil }
+            if open?.id == id { open = nil }
             drag = 0
         }
     }
 }
 
-/// The filing swipe's drag. A UIKit one, because UIKit can turn a touch down the moment it starts:
-/// only a sideways drag to the right (or to the left, to push an open tray shut) is taken, and the
-/// rest go on to the list, so scrolling and the system's left swipe keep working. SwiftUI's own drag
-/// can't hand a touch back, and the left swipe stopped working with it.
+/// Sizes for the swipe trays (a generic view can't hold its own constants).
+private enum SwipeMetrics {
+    /// How much of the message stays in view beside the open filing tray.
+    static let peek: CGFloat = 64
+    static let buttonWidth: CGFloat = 74
+    /// The ⋮ button's width.
+    static let narrowWidth: CGFloat = 56
+    /// How far a drag must go, or a flick coast, before a tray opens or shuts.
+    static let threshold: CGFloat = 60
+}
+
+/// Drawn like the system's swipe buttons: a coloured pill holding the icon, the name underneath.
+private struct SwipeButton: View {
+    let action: SwipeAction
+    let tap: () -> Void
+
+    var body: some View {
+        Button(action: tap) {
+            VStack(spacing: Space.s1) {
+                Capsule()
+                    .fill(action.color)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 40)
+                    .overlay { action.icon.image(18).foregroundStyle(.white) }
+                Text(action.label)
+                    .dsFont(.xxs, .medium)
+                    .foregroundStyle(.textMuted)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+            .padding(.horizontal, 6)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(action.spoken ?? action.label)
+    }
+}
+
+/// The swipe's drag. A UIKit one, because UIKit asks before a drag starts whether it's wanted: only
+/// a clearly sideways drag toward a tray (or toward shutting the open one) is taken, and the rest go
+/// on to the list, so scrolling keeps working.
 @available(iOS 18, *)
-private struct FilingPan: UIGestureRecognizerRepresentable {
-    let takesLeftward: Bool
+private struct SwipePan: UIGestureRecognizerRepresentable {
+    let takesRight: Bool
+    let takesLeft: Bool
     let moved: (CGFloat) -> Void
     let released: (CGFloat) -> Void
 
@@ -398,7 +437,8 @@ private struct FilingPan: UIGestureRecognizerRepresentable {
     }
 
     func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        context.coordinator.takesLeftward = takesLeftward
+        context.coordinator.takesRight = takesRight
+        context.coordinator.takesLeft = takesLeft
     }
 
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
@@ -417,34 +457,29 @@ private struct FilingPan: UIGestureRecognizerRepresentable {
     }
 
     @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var takesLeftward = false
+        var takesRight = false
+        var takesLeft = false
 
         /// Asked once, as the touch starts to move: is this drag ours?
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
             guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
             // The distance moved still reads zero here, so go by the direction the finger is heading.
             let heading = pan.velocity(in: pan.view)
-            return abs(heading.x) > abs(heading.y) * 1.5 && (heading.x > 0 || takesLeftward)
+            guard abs(heading.x) > abs(heading.y) * 1.5 else { return false }
+            return heading.x > 0 ? takesRight : takesLeft
         }
     }
 }
 
-/// The folder colors, shared by the custom tray and the system swipe on iOS 17.
-private enum FilingSwipeColors {
-    static func color(_ index: Int) -> Color {
-        LabelColor.color(LabelColor.choices[(index + 3) % LabelColor.choices.count])
-    }
-}
-
-/// Scrolling the list puts away an open filing tray. The scroll phase arrived in iOS 18, the same
-/// as the custom tray; iOS 17 uses the system's swipe, which puts itself away.
-private struct ClosesFilingTrayOnScroll: ViewModifier {
-    @Binding var openID: String?
+/// Scrolling the list puts away an open tray. The scroll phase arrived in iOS 18, the same as the
+/// hand-built trays; iOS 17 uses the system's swipes, which put themselves away.
+private struct ClosesSwipeOnScroll: ViewModifier {
+    @Binding var open: OpenSwipe?
 
     func body(content: Content) -> some View {
         if #available(iOS 18, *) {
             content.onScrollPhaseChange { _, phase in
-                if phase != .idle, openID != nil { withAnimation(.snappy) { openID = nil } }
+                if phase != .idle, open != nil { withAnimation(.snappy) { open = nil } }
             }
         } else {
             content
