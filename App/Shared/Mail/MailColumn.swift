@@ -117,8 +117,13 @@ struct MailList: View {
             }
             .presentationDetents([.medium, .large])
         }
-        // An alert, not a confirmation dialog: on a phone that shows as a popover, which hides Cancel.
-        .alert(
+        // Hung on an empty view of its own so its plain text colour doesn't reach the list.
+        .background { filingQuestion.tint(.textStrong) }
+    }
+
+    /// An alert, not a confirmation dialog: on a phone that shows as a popover, which hides Cancel.
+    private var filingQuestion: some View {
+        Color.clear.alert(
             session.filingOffer?.title ?? "",
             isPresented: Binding(
                 get: { session.filingOffer != nil },
